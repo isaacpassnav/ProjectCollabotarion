@@ -1,128 +1,103 @@
-const mongoose = require("mongoose");
-const User = require("../models/Users");
-const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
+const {getPool} = require("../config/db");
+const generateToken = require("../utils/generateToken");
 
-const generateToken = (user) => {
-  return jwt.sign(
-    { id: user._id, email: user.email, role: user.role },
-    process.env.JWT_SECRET,
-    {
-      expiresIn: "1h",
-    }
-  );
-};
 const registerUser = async (req, res) => {
+  const pool = getPool();
   try {
-    const { name, email, password, role } = req.body;
-
+    const { name, email, password } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
-
-    const existing = await User.findOne({ email });
-    if (existing) {
+    const [existing] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
+    if (existing.length > 0) {
       return res.status(409).json({ message: "Email already exists" });
     }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const [result] = await pool.query(
+      "INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)",
+      [name, email, hashedPassword, "user"]
+    );
+    const newUser = { id: result.insertId, name, email, role: "user" };
+    const token = generateToken(newUser);
 
-    const newUser = await User.create({ name, email, password, role });
-
-    return res.status(201).json({
-      message: "User registered successfully",
-      user: {
-        id: newUser._id,
-        name: newUser.name,
-        email: newUser.email,
-        role: newUser.role,
-      },
-      token: generateToken(newUser),
-    });
+    res.status(201).json({ message: "✅ User registered", user: newUser, token });
   } catch (err) {
-    console.log(" Registration error:", err);
-    return res
-      .status(500)
-      .json({ message: "Registration failed", error: err.message });
+    console.error("Registration error:", err);
+    res.status(500).json({ message: "Registration failed", error: err.message });
   }
 };
+//  Login
 const loginUser = async (req, res) => {
+  const pool = getPool();
   try {
     const { email, password } = req.body;
-    const user = await User.findOne({ email }).select("+password");
+    if (!email || !password) {
+      return res.status(400).json({ message: "Email and password required" });
+    }
 
-    if (!user || !(await user.comparePassword(password))) {
+    const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
+    if (rows.length === 0) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
-    return res.status(200).json({
-      message: "Login successful",
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-      token: generateToken(user),
+    const user = rows[0];
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+    const token = generateToken(user);
+    const message = user.role === 'admin'
+      ?`Welcome back, Admin ${user.name}!`
+      :`Welcome back, ${user.name}`;
+
+    res.status(200).json({
+      message: message,
+      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      token,
     });
   } catch (err) {
-    console.log("Login error:", err);
-    return res.status(500).json({ message: "Login failed", error: err.message });
+    console.error("❌ Login error:", err);
+    res.status(500).json({ message: "Login failed", error: err.message });
   }
 };
 
-const getAllUsers = async (req, res) => {
+const updateUser = async (req, res) => {
+  const pool = getPool();
   try {
-    const users = await User.find().select("-password");
-    res.status(200).json(users);
+    const userId = parseInt(req.params.id);
+    const { name, email, password } = req.body;
+
+    if (isNaN(userId)) return res.status(400).json({ message: "Invalid user ID" });
+
+    const updateFields = [];
+    const values = [];
+    if (name) {
+      updateFields.push("name = ?");
+      values.push(name);
+    }
+    if (email) {
+      updateFields.push("email = ?");
+      values.push(email);
+    }
+    if (password) {
+      const hashed = await bcrypt.hash(password, 10);
+      updateFields.push("password = ?");
+      values.push(hashed);
+    }
+    if (updateFields.length === 0) {
+      return res.status(400).json({ message: "No fields to update" });
+    }
+    values.push(userId);
+    const query = `UPDATE users SET ${updateFields.join(", ")} WHERE id = ?`;
+
+    const [result] = await pool.query(query, values);
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "User not found or no changes made" });
+    }
+    res.status(200).json({ message: "User updated successfully" });
   } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
+    console.error("❌ Update user error:", err);
+    res.status(500).json({ message: "Failed to update user", error: err.message });
   }
 };
-
-const getUserById = async (req, res) => {
-  try {
-    const userId = req.params.id;
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ message: "Invalid user ID" });
-    }
-    const user = await User.findById(userId).select("-password");
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    res.status(200).json(user);
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-};
-
-const putUser = async (req, res) => {
-  try {
-    const userId = req.params.id;
-    const updatedFields = req.body;
-
-    const result = await User.findByIdAndUpdate(userId, updatedFields, {
-      new: true,
-    }).select("-password");
-
-    if (!result) {
-      return res.status(404).json({ message: "User not found or update failed" });
-    }
-    res.status(200).json({ message: "User updated successfully", user: result });
-  } catch (err) {
-    res.status(500).json({ message: "Update error", error: err.message });
-  }
-};
-
-const deleteUser = async (req, res) => {
-  try {
-    const userId = req.params.id;
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ message: "Invalid User ID" });
-    }
-    const deleted = await User.findByIdAndDelete(userId);
-    if (!deleted) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    res.status(200).json({ message: "User deleted successfully" });
-  } catch (err) {
-    res.status(500).json({ message: "Delete failed", error: err.message });
-  }
-};
-module.exports = {registerUser, loginUser, getAllUsers, getUserById, putUser, deleteUser};
+module.exports = {registerUser, loginUser,updateUser};
